@@ -1,0 +1,122 @@
+#CPS
+device: 'cuda'
+seed: 1
+fold: 1
+debug: False
+log: False
+data:
+  name: 'kvasir'
+  train_folder: 'data_processed/kvasir'
+  val_folder: 'data_processed/kvasir'
+  test_folder: 'data_processed/kvasir'
+  unlabeled_folder: 'data_processed/kvasir'
+  save_folder: 'checkpoints/kvasir'
+  train_aug: True
+  img_size: 224
+
+semi:
+  conf_thresh: 0.95
+
+train:
+  l_batchsize: 4
+  u_batchsize: 4
+  num_workers: 4
+  num_epochs: 100
+  early_stop_patience: 20
+  early_stop_min_epochs: 30
+  num_iters: False # số lần cập nhật mỗi epoch
+  ema_decay: 0.99
+  optimizer:
+    mode: 'adamw'
+    adamw:
+      lr: 1e-4
+      betas: 
+        - 0.9
+        - 0.999
+      eps: 1e-8
+      weight_decay: 0.05
+    adam:
+      lr: 1e-4
+      betas:
+        - 0.9
+        - 0.999
+
+test:
+  only_test: False  # nếu True, chỉ thực hiện kiểm tra
+  test_model_dir: ''
+  num_workers: 4
+  batch_size: 8
+  
+# model:
+#   type: 'unet'  # Thêm thông tin loại mô hình
+#   in_channels: 3  # Kênh đầu vào
+#   out_channels: 1  # Kênh đầu ra
+
+# Nếu cần thiết, bạn có thể thêm các thông số khác cho U-Net
+# ví dụ, nếu bạn cần điều chỉnh số kênh hoặc các tham số cụ thể khác
+
+model_encoder_id: 0
+model_adapt:
+  adapt_method: False
+  num_domains: 1
+
+# # U2PL
+# # =================================================unet================================
+# device: 'cuda'
+# seed: 1
+# fold: 1
+# debug: False
+# log: False
+# data:
+#   name: 'stare'
+#   train_folder: 'data_processed/stare/'
+#   val_folder: 'data_processed/stare/'
+#   test_folder: 'data_processed/stare/'
+#   save_folder: 'checkpoints/stare'
+#   supervised_ratio: 0.25
+#   train_aug: True
+#   img_size: 512
+
+# semi:
+#   conf_thresh: 0.9
+
+# train:
+#   l_batchsize: 1
+#   u_batchsize: 1
+#   sup_only_epoch: 20
+#   num_workers: 0
+#   num_epochs: 200
+#   num_iters: False # số lần cập nhật mỗi epoch
+#   optimizer:
+#     mode: 'adamw'
+#     adamw:
+#       lr: 1e-4
+#       betas: 
+#         - 0.9
+#         - 0.999
+#       eps: 1e-8
+#       weight_decay: 0.05
+#     adam:
+#       lr: 1e-4
+#       betas:
+#         - 0.9
+#         - 0.999
+
+# test:
+#   only_test: False  # nếu True, chỉ thực hiện kiểm tra
+#   test_model_dir: ''
+#   num_workers: 0
+#   batch_size: 1
+
+# model:
+#   type: 'unet'  # Thêm thông tin loại mô hình
+#   in_channels: 3  # Kênh đầu vào
+#   out_channels: 1  # Kênh đầu ra
+
+# # Nếu cần thiết, bạn có thể thêm các thông số khác cho U-Net
+# # ví dụ, nếu bạn cần điều chỉnh số kênh hoặc các tham số cụ thể khác
+
+# model_encoder_id: 0
+# model_adapt:
+#   adapt_method: False
+#   num_domains: 1

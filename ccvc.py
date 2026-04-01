@@ -166,6 +166,10 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
     max_dice = -float('inf')
     best_epoch = 0
     model = model1
+
+    early_stop_patience = config.train.early_stop_patience if getattr(config.train, 'early_stop_patience', None) is not None else 10
+    early_stop_min_epochs = config.train.early_stop_min_epochs if getattr(config.train, 'early_stop_min_epochs', None) is not None else 30
+    no_improve_epochs = 0
     
     torch.save(model.state_dict(), best_model_dir)
     
@@ -298,6 +302,18 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
             print(message)
             file_log.write(message + '\n')
             file_log.flush()
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+
+        # Early stopping check
+        if epoch >= early_stop_min_epochs and no_improve_epochs > early_stop_patience:
+            early_message = (f'Early stopping at epoch {epoch} after {no_improve_epochs} epochs without improvement. '
+                             f'Best epoch: {best_epoch}, best Dice: {max_dice:.4f}')
+            print(early_message)
+            file_log.write(early_message + '\n')
+            file_log.flush()
+            break
         
         # Update learning rate
         scheduler1.step()
@@ -427,7 +443,7 @@ if __name__=='__main__':
     store_config = config
     config = DotDict(config)
     
-    folds_to_train = [4]
+    folds_to_train = [1,2,3,4,5]
     
     for fold in folds_to_train:
         print(f"\n=== Training Fold {fold} ===")

@@ -154,6 +154,11 @@ def train_val(config, model, train_loader, val_loader, criterion):
     train_dice = DiceMetric(include_background=True, num_classes=3, reduction="mean")
     train_iou = MeanIoU(include_background=True, reduction="mean")
     
+    # Early stopping configuration
+    early_stop_patience = config.train.early_stop_patience if getattr(config.train, 'early_stop_patience', None) is not None else 10
+    early_stop_min_epochs = config.train.early_stop_min_epochs if getattr(config.train, 'early_stop_min_epochs', None) is not None else 30
+    no_improve_epochs = 0
+
     # Training loop
     max_dice_score = -float('inf')  # Track the best Dice score
     best_epoch = 0
@@ -273,12 +278,23 @@ def train_val(config, model, train_loader, val_loader, criterion):
             max_dice_score = val_metrics['dice']
             best_epoch = epoch
             torch.save(model.state_dict(), best_model_dir)
+            no_improve_epochs = 0
             
             message = (f'New best epoch {epoch}! '
                       f'Dice: {val_metrics["dice"]:.4f}')
             print(message)
             file_log.write(message + '\n')
             file_log.flush()
+        else:
+            no_improve_epochs += 1
+            
+        # Early stopping check
+        if epoch >= early_stop_min_epochs and no_improve_epochs > early_stop_patience:
+            early_message = (f'Early stopping at epoch {epoch} after {no_improve_epochs} epochs without improvement.')
+            print(early_message)
+            file_log.write(early_message + '\n')
+            file_log.flush()
+            break
         
         # Update learning rate
         scheduler.step()

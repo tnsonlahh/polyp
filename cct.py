@@ -22,8 +22,7 @@ from monai.metrics import *
 
 from Datasets.create_dataset import *
 from Models.DeepLabV3Plus.modeling import *
-from Utils.pieces import DotDict
-from Utils.functions import fix_all_seed
+from Utils.utils import DotDict, fix_all_seed
 
 torch.cuda.empty_cache()
 

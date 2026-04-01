@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints
+checkpoints/
+dcd/
+# Kvasir segmentation dataset folder
+kvasir-seg/
+data_processed/
+# Setup files/folders
+setup.py
+
+*.pyc
+*.pyo
+*.pyd
