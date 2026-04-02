@@ -69,5 +69,7 @@ python3 train_sup.py --config_yml Configs/kvasir_seg.yml --gpu 0 --exp my_experi
 
 - `prepare_kvasir.py` phải chạy trước để tạo dữ liệu `data_processed/kvasir`.
 - Training sử dụng `Configs/kvasir_seg.yml` để lấy cấu hình Kvasir.
+- Hiện tại các file train mặc định được thiết lập để labeled data chiếm khoảng 40% tổng dữ liệu train.
+- Nếu muốn chỉ dùng 20% labeled, cần sửa lại cấu hình `data.supervised_ratio` trong `Configs/kvasir_seg.yml` và/hoặc chuyển sang sử dụng `get_dataset(... supervised_ratio=0.2 ...)`.
 - Nếu raw data ở vị trí khác, sửa lại `--src` cho phù hợp.
 - Nếu dùng một GPU khác, thay `--gpu 0` bằng `--gpu 1` hoặc giá trị phù hợp.

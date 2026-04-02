@@ -381,7 +381,17 @@ def get_dataset(args, img_size=384, supervised_ratio=0.2, train_aug=False, k=6, 
     # Load fold data
     folds = []
     for idx in range(1, 6):
-        with open(f'{args.data.train_folder}/fold{idx}.txt', 'r') as f:
+        fold_file = f'{args.data.train_folder}/fold{idx}.txt'
+        fold_label_file = f'{args.data.train_folder}/fold_label_{idx}.txt'
+        if os.path.exists(fold_file):
+            path = fold_file
+        elif os.path.exists(fold_label_file):
+            path = fold_label_file
+        else:
+            raise FileNotFoundError(
+                f'Fold file not found for fold {idx}: checked {fold_file} and {fold_label_file}'
+            )
+        with open(path, 'r') as f:
             fold = [line.strip() for line in f.readlines()]
         folds.append(fold)
 

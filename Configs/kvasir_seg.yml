@@ -13,6 +13,7 @@ data:
   save_folder: 'checkpoints/kvasir'
   train_aug: True
   img_size: 224
+  supervised_ratio: 0.2
 
 semi:
   conf_thresh: 0.95
