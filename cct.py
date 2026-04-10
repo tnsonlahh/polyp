@@ -31,9 +31,10 @@ def main(config):
     Main training function.
     """
     # Setup datasets and dataloaders
-    dataset = get_dataset_without_full_label(
+    dataset = get_dataset(
         config, 
         img_size=config.data.img_size,
+        supervised_ratio=config.data.get('supervised_ratio', 0.2),
         train_aug=config.data.train_aug,
         k=config.fold,
         lb_dataset=Dataset,
@@ -127,6 +128,11 @@ def train_val(config, model, train_loader, val_loader, criterion):
     max_dice = -float('inf')
     best_epoch = 0
     iter_num = 0
+    
+    # Early stopping configuration
+    early_stop_patience = config.train.early_stop_patience if getattr(config.train, 'early_stop_patience', None) is not None else 10
+    early_stop_min_epochs = config.train.early_stop_min_epochs if getattr(config.train, 'early_stop_min_epochs', None) is not None else 30
+    no_improve_epochs = 0
     
     torch.save(model.state_dict(), best_model_dir)
     
@@ -246,11 +252,22 @@ def train_val(config, model, train_loader, val_loader, criterion):
             max_dice = val_metrics['dice']
             best_epoch = epoch
             torch.save(model.state_dict(), best_model_dir)
+            no_improve_epochs = 0
             
             message = f'New best epoch {epoch}! Dice: {val_metrics["dice"]:.4f}'
             print(message)
             file_log.write(message + '\n')
             file_log.flush()
+        else:
+            no_improve_epochs += 1
+        
+        # Early stopping check
+        if epoch >= early_stop_min_epochs and no_improve_epochs > early_stop_patience:
+            early_message = (f'Early stopping at epoch {epoch} after {no_improve_epochs} epochs without improvement.')
+            print(early_message)
+            file_log.write(early_message + '\n')
+            file_log.flush()
+            break
         
         # Update learning rate
         scheduler.step()

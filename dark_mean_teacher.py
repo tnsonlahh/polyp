@@ -20,6 +20,85 @@ from Datasets.create_dataset import *
 from Models.DeepLabV3Plus.modeling import *
 from Utils.utils import DotDict, fix_all_seed
 
+# ============================================================
+# Dark-Aware Mean Teacher (DAMT) Components
+# ============================================================
+
+def random_gamma_transform(image, gamma_range=(0.4, 2.5)):
+    """
+    Apply per-sample random gamma correction on GPU.
+    Lower gamma (<1) brightens, higher gamma (>1) darkens the image.
+    This forces the student to handle extreme lighting variations
+    while the teacher sees the original image.
+    """
+    gamma = torch.empty(image.shape[0], 1, 1, 1, device=image.device).uniform_(
+        gamma_range[0], gamma_range[1]
+    )
+    return torch.clamp(image ** gamma, 0.0, 1.0)
+
+
+def compute_dark_region_weights(image, dark_threshold=0.35, boost_factor=3.0):
+    """
+    Build a per-pixel weight map that upweights dark regions.
+    Uses a smooth sigmoid transition so gradients flow properly.
+    """
+    gray = image.mean(dim=1, keepdim=True)  # B, 1, H, W
+    dark_weight = 1.0 + boost_factor * torch.sigmoid(
+        (dark_threshold - gray) / 0.05
+    )
+    return dark_weight
+
+
+class DarkRegionWeightedMSE(nn.Module):
+    """
+    MSE consistency loss weighted by dark-region importance.
+    Dark pixels receive higher weight, forcing teacher-student
+    agreement to be stronger in regions where models typically fail.
+    """
+    def __init__(self, dark_threshold=0.35, boost_factor=3.0):
+        super().__init__()
+        self.dark_threshold = dark_threshold
+        self.boost_factor = boost_factor
+
+    def forward(self, student_pred, teacher_pred, image):
+        weight_map = compute_dark_region_weights(
+            image, self.dark_threshold, self.boost_factor
+        )
+        mse = (student_pred - teacher_pred) ** 2  # B, C, H, W
+        weighted_mse = (mse * weight_map).mean()
+        return weighted_mse
+
+
+def extract_boundary(label, kernel_size=3):
+    """
+    Extract object boundaries from one-hot labels using
+    morphological dilation minus erosion.
+    """
+    pad = kernel_size // 2
+    dilated = F.max_pool2d(label, kernel_size, stride=1, padding=pad)
+    eroded = -F.max_pool2d(-label, kernel_size, stride=1, padding=pad)
+    boundary = dilated - eroded
+    return (boundary.sum(dim=1, keepdim=True) > 0).float()
+
+
+class BoundaryAwareLoss(nn.Module):
+    """
+    CE loss with higher weight at object boundaries.
+    Polyps in dark/deep corners often have weak, blurred edges;
+    this loss forces the model to produce sharper segmentation borders.
+    """
+    def __init__(self, boundary_weight=2.0):
+        super().__init__()
+        self.boundary_weight = boundary_weight
+
+    def forward(self, pred, label_onehot):
+        boundary = extract_boundary(label_onehot)
+        weight_map = 1.0 + self.boundary_weight * boundary  # B, 1, H, W
+        target = label_onehot.argmax(dim=1)  # B, H, W
+        ce = F.cross_entropy(pred, target, reduction='none')  # B, H, W
+        weighted_ce = (ce * weight_map.squeeze(1)).mean()
+        return weighted_ce
+
 def create_model(ema=False):
     """
     Create a new model instance with EMA support.
@@ -122,16 +201,25 @@ def main(config):
         include_background=True
     ).cuda()
     
-    criterion_cons = nn.MSELoss().cuda()
+    # DAMT: Dark-region weighted consistency instead of plain MSE
+    criterion_cons = DarkRegionWeightedMSE(
+        dark_threshold=args.dark_threshold,
+        boost_factor=args.dark_boost
+    ).cuda()
+    
+    # DAMT: Boundary-aware auxiliary loss
+    criterion_boundary = BoundaryAwareLoss(
+        boundary_weight=args.boundary_weight
+    ).cuda()
 
     # Train and test
     best_model = train_val(config, model, ema_model, train_loader, val_loader, 
-                          criterion_sup, criterion_cons)
+                          criterion_sup, criterion_cons, criterion_boundary)
     test(config, best_model, best_model_dir, test_loader, criterion_sup)
 
-def train_val(config, model, ema_model, train_loader, val_loader, criterion_sup, criterion_cons):
+def train_val(config, model, ema_model, train_loader, val_loader, criterion_sup, criterion_cons, criterion_boundary):
     """
-    Training and validation function for Mean Teacher method.
+    Training and validation function for Dark-Aware Mean Teacher.
     """
     # Setup optimizer
     optimizer = optim.AdamW(
@@ -173,26 +261,40 @@ def train_val(config, model, ema_model, train_loader, val_loader, criterion_sup,
             img_l = batch_l['image'].cuda().float()
             label_l = batch_l['label'].cuda().float()
             
-            # Get unlabeled data (single augmentation)
-            img_u = batch_u['img_w'].cuda().float()
+            # Get unlabeled data (weak augmentation)
+            img_u_orig = batch_u['img_w'].cuda().float()
+            
+            # DAMT: Apply random gamma transform to create lighting-variant
+            # input for the student. Teacher sees the original image.
+            img_u_gamma = random_gamma_transform(
+                img_u_orig, gamma_range=(args.gamma_low, args.gamma_high)
+            )
             
             # Forward passes
             outputs_l = model(img_l)
-            outputs_u = model(img_u)
+            outputs_u = model(img_u_gamma)        # student sees gamma-transformed
             
             with torch.no_grad():
-                teacher_outputs_u = ema_model(img_u)
+                teacher_outputs_u = ema_model(img_u_orig)  # teacher sees original
             
-            # Calculate supervised loss
+            # Calculate supervised loss (Dice-Focal)
             sup_loss = criterion_sup(outputs_l, label_l)
             
-            # Calculate consistency loss
-            consistency_weight = get_current_consistency_weight(epoch)
-            consistency_loss = criterion_cons(outputs_u.softmax(dim=1), 
-                                           teacher_outputs_u.softmax(dim=1))
+            # DAMT: Boundary-aware edge loss on labeled data
+            boundary_loss = criterion_boundary(outputs_l, label_l)
             
-            # Total loss
-            loss = sup_loss + consistency_weight * consistency_loss
+            # DAMT: Dark-region weighted consistency loss
+            consistency_weight = get_current_consistency_weight(epoch)
+            consistency_loss = criterion_cons(
+                outputs_u.softmax(dim=1),
+                teacher_outputs_u.softmax(dim=1),
+                img_u_orig  # weight map computed from original intensity
+            )
+            
+            # Total loss = supervised + boundary + consistency
+            loss = (sup_loss 
+                    + args.boundary_loss_weight * boundary_loss 
+                    + consistency_weight * consistency_loss)
             
             # Optimization step
             optimizer.zero_grad()
@@ -357,6 +459,19 @@ if __name__ == '__main__':
     parser.add_argument('--consistency', type=float, default=0.1)
     parser.add_argument('--consistency_rampup', type=float, default=200.0)
     parser.add_argument('--ema_decay', type=float, default=0.999)
+    # DAMT: Dark-Aware Mean Teacher hyperparameters
+    parser.add_argument('--gamma_low', type=float, default=0.4,
+                        help='Lower bound of gamma for random gamma transform')
+    parser.add_argument('--gamma_high', type=float, default=2.5,
+                        help='Upper bound of gamma for random gamma transform')
+    parser.add_argument('--dark_threshold', type=float, default=0.35,
+                        help='Intensity threshold below which pixels are considered dark')
+    parser.add_argument('--dark_boost', type=float, default=3.0,
+                        help='How much extra consistency weight dark pixels receive')
+    parser.add_argument('--boundary_weight', type=float, default=2.0,
+                        help='Extra CE weight at object boundaries')
+    parser.add_argument('--boundary_loss_weight', type=float, default=0.5,
+                        help='Weight of the boundary-aware loss in total loss')
     
     args = parser.parse_args()
     

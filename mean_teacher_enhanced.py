@@ -1,3 +1,17 @@
+"""
+Mean Teacher Enhanced — Minimal improvements over baseline Mean Teacher.
+
+Changes from original mean_teacher.py (3 changes only):
+1. StrongWeakAugment4 → StrongWeakAugment: student sees STRONG aug, teacher sees WEAK aug
+   (FixMatch paradigm — the #1 consensus improvement from UniMatch, CorrMatch, FixMatch)
+2. MSE consistency → Pseudo-label CE with confidence threshold
+   (Hard labels + threshold filter = ignore noisy teacher predictions)
+3. Both changes compound: teacher gives pseudo-labels on EASY (weak) view,
+   student must match on HARD (strong) view → learns harder features including dark regions
+
+No new architecture modules. No new loss functions. No new hyperparameters besides conf_thresh.
+"""
+
 import os
 import time
 import argparse
@@ -21,9 +35,6 @@ from Models.DeepLabV3Plus.modeling import *
 from Utils.utils import DotDict, fix_all_seed
 
 def create_model(ema=False):
-    """
-    Create a new model instance with EMA support.
-    """
     model = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
     if ema:
         for param in model.parameters():
@@ -31,17 +42,11 @@ def create_model(ema=False):
     return model
 
 def update_ema_variables(model, ema_model, alpha, global_step):
-    """
-    Update teacher model parameters using exponential moving average.
-    """
     alpha = min(1 - 1 / (global_step + 1), alpha)
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data.mul_(alpha).add_(param.data, alpha=1 - alpha)
 
 def sigmoid_rampup(current, rampup_length):
-    """
-    Exponential rampup from https://arxiv.org/abs/1610.02242
-    """
     if rampup_length == 0:
         return 1.0
     current = np.clip(current, 0.0, rampup_length)
@@ -49,14 +54,12 @@ def sigmoid_rampup(current, rampup_length):
     return float(np.exp(-5.0 * phase * phase))
 
 def get_current_consistency_weight(epoch):
-    """Calculate the consistency weight for the current epoch."""
     return args.consistency * sigmoid_rampup(epoch, args.consistency_rampup)
 
 def main(config):
-    """
-    Main training function for Mean Teacher method.
-    """
-    # Setup datasets and dataloaders (use supervised_ratio for labeled split)
+    # ===== CHANGE 1: Use StrongWeakAugment instead of StrongWeakAugment4 =====
+    # StrongWeakAugment returns both img_w (weak) and img_s (strong)
+    # This enables weak-to-strong consistency (FixMatch paradigm)
     dataset = get_dataset(
         config,
         img_size=config.data.img_size,
@@ -64,7 +67,7 @@ def main(config):
         train_aug=config.data.train_aug,
         k=config.fold,
         lb_dataset=Dataset,
-        ulb_dataset=StrongWeakAugment4
+        ulb_dataset=StrongWeakAugment       # Changed from StrongWeakAugment4
     )
     
     l_train_loader = DataLoader(
@@ -102,11 +105,9 @@ def main(config):
     train_loader = {'l_loader': l_train_loader, 'u_loader': u_train_loader}
     print(f"Unlabeled batches: {len(u_train_loader)}, Labeled batches: {len(l_train_loader)}")
 
-    # Create student and teacher models
     model = create_model()
     ema_model = create_model(ema=True)
 
-    # Print model statistics
     total_params = sum(p.numel() for p in model.parameters())
     total_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'{total_params/1e6:.2f}M total parameters')
@@ -115,25 +116,20 @@ def main(config):
     model = model.cuda()
     ema_model = ema_model.cuda()
 
-    # Setup loss functions
     criterion_sup = GeneralizedDiceFocalLoss(
         softmax=True,
         to_onehot_y=False,
         include_background=True
     ).cuda()
     
-    criterion_cons = nn.MSELoss().cuda()
+    # ===== CHANGE 2: CE loss for pseudo-labels instead of MSE =====
+    criterion_cons = nn.CrossEntropyLoss(reduction='none').cuda()
 
-    # Train and test
     best_model = train_val(config, model, ema_model, train_loader, val_loader, 
                           criterion_sup, criterion_cons)
     test(config, best_model, best_model_dir, test_loader, criterion_sup)
 
 def train_val(config, model, ema_model, train_loader, val_loader, criterion_sup, criterion_cons):
-    """
-    Training and validation function for Mean Teacher method.
-    """
-    # Setup optimizer
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=float(config.train.optimizer.adamw.lr),
@@ -142,15 +138,12 @@ def train_val(config, model, ema_model, train_loader, val_loader, criterion_sup,
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.train.num_epochs, eta_min=1e-6)
 
-    # Initialize metrics
     train_dice = DiceMetric(include_background=True, reduction="mean")
     
-    # Early stopping configuration
     early_stop_patience = config.train.early_stop_patience if getattr(config.train, 'early_stop_patience', None) is not None else 20
     early_stop_min_epochs = config.train.early_stop_min_epochs if getattr(config.train, 'early_stop_min_epochs', None) is not None else 50
     no_improve_epochs = 0
 
-    # Training loop
     max_dice = -float('inf')
     best_epoch = 0
     global_step = 0
@@ -158,7 +151,6 @@ def train_val(config, model, ema_model, train_loader, val_loader, criterion_sup,
     for epoch in range(config.train.num_epochs):
         start = time.time()
         
-        # Training phase
         model.train()
         ema_model.train()
         train_metrics = {'dice': 0, 'loss': 0}
@@ -169,41 +161,47 @@ def train_val(config, model, ema_model, train_loader, val_loader, criterion_sup,
         train_dice.reset()
         
         for batch_idx, (batch_l, batch_u) in enumerate(train_loop):
-            # Get labeled data
             img_l = batch_l['image'].cuda().float()
             label_l = batch_l['label'].cuda().float()
             
-            # Get unlabeled data (single augmentation)
-            img_u = batch_u['img_w'].cuda().float()
+            # ===== CHANGE 3: Weak-to-strong consistency =====
+            # Teacher sees weak augmentation → generates pseudo-labels
+            # Student sees strong augmentation → must match pseudo-labels
+            img_u_w = batch_u['img_w'].cuda().float()   # weak view for teacher
+            img_u_s = batch_u['img_s'].cuda().float()   # strong view for student
             
-            # Forward passes
+            # Student forward on labeled + student forward on strong unlabeled
             outputs_l = model(img_l)
-            outputs_u = model(img_u)
+            outputs_u_s = model(img_u_s)
             
+            # Teacher forward on weak unlabeled (no gradient)
             with torch.no_grad():
-                teacher_outputs_u = ema_model(img_u)
+                teacher_outputs_u = ema_model(img_u_w)
+                teacher_probs = teacher_outputs_u.softmax(dim=1)
+                teacher_conf, _ = teacher_probs.max(dim=1)     # (B, H, W)
+                pseudo_labels = teacher_outputs_u.argmax(dim=1) # (B, H, W)
+                
+                # Confidence mask: only train where teacher is confident
+                conf_mask = (teacher_conf >= args.conf_thresh).float()
             
-            # Calculate supervised loss
+            # Supervised loss (same as baseline)
             sup_loss = criterion_sup(outputs_l, label_l)
             
-            # Calculate consistency loss
+            # Consistency loss: CE on pseudo-labels, masked by confidence
             consistency_weight = get_current_consistency_weight(epoch)
-            consistency_loss = criterion_cons(outputs_u.softmax(dim=1), 
-                                           teacher_outputs_u.softmax(dim=1))
+            cons_loss_per_pixel = criterion_cons(outputs_u_s, pseudo_labels)  # (B, H, W)
+            cons_loss = (cons_loss_per_pixel * conf_mask).sum() / (conf_mask.sum() + 1e-6)
             
             # Total loss
-            loss = sup_loss + consistency_weight * consistency_loss
+            loss = sup_loss + consistency_weight * cons_loss
             
-            # Optimization step
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
-            # Update teacher model
             global_step += 1
             update_ema_variables(model, ema_model, args.ema_decay, global_step)
             
-            # Calculate metrics
             with torch.no_grad():
                 output_onehot = torch.zeros_like(outputs_l)
                 output_onehot.scatter_(1, outputs_l.argmax(dim=1, keepdim=True), 1)
@@ -213,22 +211,21 @@ def train_val(config, model, ema_model, train_loader, val_loader, criterion_sup,
                 train_metrics['loss'] = (train_metrics['loss'] * num_train + loss.item() * img_l.shape[0]) / (num_train + img_l.shape[0])
                 num_train += img_l.shape[0]
             
-            # Update progress bar
+            mask_ratio = conf_mask.mean().item()
             train_loop.set_postfix({
                 'Loss': f"{loss.item():.4f}",
-                'Dice': f"{train_dice.aggregate().item():.4f}"
+                'Dice': f"{train_dice.aggregate().item():.4f}",
+                'Mask': f"{mask_ratio:.2f}"
             })
             
             if config.debug:
                 break
         
-        # Get final training metrics
         train_metrics['dice'] = train_dice.aggregate().item()
         
-        # Validation phase
+        # Validation
         val_metrics = validate_model(ema_model, val_loader, criterion_sup)
         
-        # Save best model
         if val_metrics['dice'] > max_dice:
             max_dice = val_metrics['dice']
             best_epoch = epoch
@@ -250,12 +247,12 @@ def train_val(config, model, ema_model, train_loader, val_loader, criterion_sup,
             file_log.flush()
             break
         
-        # Update learning rate
         scheduler.step()
         
-        # Log epoch time
         time_elapsed = time.time() - start
-        print(f'Epoch {epoch} completed in {time_elapsed//60:.0f}m {time_elapsed%60:.0f}s')
+        print(f'Epoch {epoch} | Train Dice: {train_metrics["dice"]:.4f} | '
+              f'Val Dice: {val_metrics["dice"]:.4f} | '
+              f'{time_elapsed//60:.0f}m {time_elapsed%60:.0f}s')
         print('='*80)
         
         if config.debug:
@@ -265,14 +262,10 @@ def train_val(config, model, ema_model, train_loader, val_loader, criterion_sup,
     return ema_model
 
 def validate_model(model, val_loader, criterion):
-    """
-    Validate model using MONAI metrics.
-    """
     model.eval()
     metrics = {'dice': 0, 'iou': 0, 'hd': 0, 'loss': 0}
     num_val = 0
     
-    # Initialize metrics
     dice_metric = DiceMetric(include_background=True, reduction="mean")
     iou_metric = MeanIoU(include_background=True, reduction="mean")
     hd_metric = HausdorffDistanceMetric(include_background=True, percentile=95.0)
@@ -286,19 +279,16 @@ def validate_model(model, val_loader, criterion):
             output = model(img)
             loss = criterion(output, label)
             
-            # Convert predictions to one-hot
             preds = torch.argmax(output, dim=1, keepdim=True)
             preds_onehot = torch.zeros_like(output)
             preds_onehot.scatter_(1, preds, 1)
             
-            # Convert labels to one-hot if needed
             if len(label.shape) == 4:
                 labels_onehot = label
             else:
                 labels_onehot = torch.zeros_like(output)
                 labels_onehot.scatter_(1, label.unsqueeze(1), 1)
             
-            # Update metrics
             dice_metric(y_pred=preds_onehot, y=labels_onehot)
             iou_metric(y_pred=preds_onehot, y=labels_onehot)
             hd_metric(y_pred=preds_onehot, y=labels_onehot)
@@ -306,12 +296,10 @@ def validate_model(model, val_loader, criterion):
             metrics['loss'] = (metrics['loss'] * num_val + loss.item() * img.shape[0]) / (num_val + img.shape[0])
             num_val += img.shape[0]
     
-    # Aggregate metrics
     metrics['dice'] = dice_metric.aggregate().item()
     metrics['iou'] = iou_metric.aggregate().item()
     metrics['hd'] = hd_metric.aggregate().item()
     
-    # Reset metrics
     dice_metric.reset()
     iou_metric.reset()
     hd_metric.reset()
@@ -319,9 +307,6 @@ def validate_model(model, val_loader, criterion):
     return metrics
 
 def test(config, model, model_dir, test_loader, criterion):
-    """
-    Test the model on test set.
-    """
     model.load_state_dict(torch.load(model_dir))
     metrics = validate_model(model, test_loader, criterion)
     
@@ -344,7 +329,7 @@ def test(config, model, model_dir, test_loader, criterion):
     file_log.flush()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Mean Teacher Training')
+    parser = argparse.ArgumentParser(description='Mean Teacher Enhanced')
     parser.add_argument('--exp', type=str, default='tmp')
     parser.add_argument('--config_yml', type=str, default='Configs/multi_train_local.yml')
     parser.add_argument('--adapt_method', type=str, default=False)
@@ -357,10 +342,12 @@ if __name__ == '__main__':
     parser.add_argument('--consistency', type=float, default=0.1)
     parser.add_argument('--consistency_rampup', type=float, default=200.0)
     parser.add_argument('--ema_decay', type=float, default=0.999)
+    # Only 1 new hyperparameter
+    parser.add_argument('--conf_thresh', type=float, default=0.95,
+                        help='Confidence threshold for pseudo-label filtering')
     
     args = parser.parse_args()
     
-    # Load and update config
     config = yaml.load(open(args.config_yml), Loader=yaml.FullLoader)
     config['data']['name'] = args.dataset
     config['model_adapt']['adapt_method'] = args.adapt_method
@@ -369,14 +356,12 @@ if __name__ == '__main__':
     config['seed'] = args.seed
     config['fold'] = args.fold
     
-    # Setup CUDA and seeds
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = True
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     fix_all_seed(config['seed'])
     
-    # Print configuration
     print(yaml.dump(config, default_flow_style=False))
     for arg in vars(args):
         print(f"{arg:<20}: {getattr(args, arg)}")
@@ -384,22 +369,18 @@ if __name__ == '__main__':
     store_config = config
     config = DotDict(config)
     
-    # Train each fold
     for fold in [1,2,3,4,5]:
         print(f"\n=== Training Fold {fold} ===")
         config['fold'] = fold
         
-        # Setup directories
         exp_dir = f"{config.data.save_folder}/{args.exp}/fold{fold}"
         os.makedirs(exp_dir, exist_ok=True)
         best_model_dir = f'{exp_dir}/best.pth'
         test_results_dir = f'{exp_dir}/test_results.txt'
         
-        # Save config
         if not config.debug:
             yaml.dump(store_config, open(f'{exp_dir}/exp_config.yml', 'w'))
         
-        # Train fold
         with open(f'{exp_dir}/log.txt', 'w') as file_log:
             main(config)
         

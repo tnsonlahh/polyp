@@ -88,17 +88,30 @@ class DiceLoss(nn.Module):
                 
         return loss / self.n_classes
     
-def save_model(net, path):
-    """Save only model state dict."""
-    torch.save(net.state_dict(), str(path))
+def save_model(net, path, metrics=None):
+    """Save model state dict with optional metrics."""
+    if metrics is None:
+        torch.save(net.state_dict(), str(path))
+    else:
+        checkpoint = {
+            'model': net.state_dict(),
+            'metrics': metrics
+        }
+        torch.save(checkpoint, str(path))
 
 def save_optimizer(optimizer, path):
     """Save only optimizer state dict."""
     torch.save(optimizer.state_dict(), str(path))
 
 def load_model(net, path):
-    """Load only model state dict."""
-    net.load_state_dict(torch.load(str(path)))
+    """Load model state dict, handling both old and new checkpoint formats."""
+    checkpoint = torch.load(str(path))
+    if isinstance(checkpoint, dict) and 'model' in checkpoint:
+        # New format with metrics
+        net.load_state_dict(checkpoint['model'])
+    else:
+        # Old format: just state dict
+        net.load_state_dict(checkpoint)
 
 def load_optimizer(optimizer, path):
     """Load only optimizer state dict."""
@@ -134,7 +147,8 @@ def sigmoid_rampup(current, rampup_length):
 
 def get_current_consistency_weight(epoch, config):
     """Calculate the consistency weight for the current epoch."""
-    return config.semi.conf_thresh * sigmoid_rampup(epoch, config.train.warmup_epoch)
+    warmup_epoch = config.train.warmup_epoch if getattr(config.train, 'warmup_epoch', None) is not None else 15
+    return config.semi.conf_thresh * sigmoid_rampup(epoch, warmup_epoch)
 
 def generate_mask(img):
     batch_size, channel, img_x, img_y = img.shape[0], img.shape[1], img.shape[2], img.shape[3]
@@ -186,7 +200,10 @@ def validate_model(model, val_loader):
     num_val = 0
     
     # Initialize MONAI metrics
-    dice_metric = DiceMetric(include_background=True, num_classes=config.model.num_classes, reduction="mean")
+    num_classes = 3
+    if hasattr(config, 'model') and getattr(config.model, 'num_classes', None) is not None:
+        num_classes = config.model.num_classes
+    dice_metric = DiceMetric(include_background=True, num_classes=num_classes, reduction="mean")
     iou_metric = MeanIoU(include_background=True, reduction="mean")
     hd_metric = HausdorffDistanceMetric(include_background=True, percentile=95.0)
     
@@ -198,6 +215,16 @@ def validate_model(model, val_loader):
         
         with torch.no_grad():
             output = model(img)
+
+            # Compute validation CE loss against class indices.
+            if label.ndim == 4 and label.shape[1] > 1:
+                label_idx = label.argmax(dim=1).long()
+            elif label.ndim == 4 and label.shape[1] == 1:
+                label_idx = label.squeeze(1).long()
+            else:
+                label_idx = label.long()
+            batch_loss = F.cross_entropy(output, label_idx)
+            metrics['loss'] = (metrics['loss'] * num_val + batch_loss.item() * batch_len) / (num_val + batch_len)
          
             # Convert predictions to one-hot format
             preds = torch.argmax(output, dim=1, keepdim=True)
@@ -240,7 +267,7 @@ def pre_train(config, snapshot_path, file_log):
     Pre-training phase using config parameters
     """
     base_lr = config.train.optimizer.adamw.lr
-    max_epoch = config.train.warmup_epoch
+    max_epoch = config.train.warmup_epoch if getattr(config.train, 'warmup_epoch', None) is not None else 15
     
     # Fix GPU setting
     gpu = getattr(config, 'gpu', '0')
@@ -264,10 +291,11 @@ def pre_train(config, snapshot_path, file_log):
     def worker_init_fn(worker_id):
         random.seed(config.seed + worker_id)
 
-    # Setup datasets and dataloaders
-    dataset = get_dataset_without_full_label(
+    # Setup datasets and dataloaders (use supervised_ratio for labeled split)
+    dataset = get_dataset(
         config,
         img_size=config.data.img_size,
+        supervised_ratio=config.data.get('supervised_ratio', 0.2),
         train_aug=config.data.train_aug,
         k=config.fold,
         lb_dataset=Dataset,
@@ -319,9 +347,12 @@ def pre_train(config, snapshot_path, file_log):
     model.train()
     iter_num = 0
     best_performance = 0.0
+    early_stop_patience = config.train.early_stop_patience if getattr(config.train, 'early_stop_patience', None) is not None else 20
+    early_stop_min_epochs = config.train.early_stop_min_epochs if getattr(config.train, 'early_stop_min_epochs', None) is not None else 30
+    no_improve_epochs = 0
     
-    # Sử dụng số epoch từ config
-    max_epoch = config.train.warmup_epoch
+    # Sử dụng số epoch từ config (fallback nếu warmup_epoch chưa được set)
+    max_epoch = config.train.warmup_epoch if getattr(config.train, 'warmup_epoch', None) is not None else 15
     
     for epoch in range(max_epoch):
         start = time.time()
@@ -402,12 +433,23 @@ def pre_train(config, snapshot_path, file_log):
 
         if performance > best_performance:
             best_performance = performance
-            save_model(model, best_model_path)
+            save_model(model, best_model_path, metrics)
             save_optimizer(optimizer, best_optim_path)
-            message = f'Saved new best model with dice {performance:.4f}'
+            message = f'Saved new best model | Dice: {metrics["dice"]:.4f}, IoU: {metrics["iou"]:.4f}, HD: {metrics["hd"]:.4f}, Loss: {metrics["loss"]:.5f}'
             print(message)
             file_log.write(message + '\n')
             file_log.flush()
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+
+        if epoch >= early_stop_min_epochs and no_improve_epochs > early_stop_patience:
+            early_message = (f'Early stopping pre-train at epoch {epoch} after '
+                             f'{no_improve_epochs} epochs without improvement.')
+            print(early_message)
+            file_log.write(early_message + '\n')
+            file_log.flush()
+            break
 
         model.train()
 
@@ -424,7 +466,8 @@ def self_train(config, pre_snapshot_path, snapshot_path, file_log):
     Self-training phase using config parameters
     """
     base_lr = config.train.optimizer.adamw.lr
-    max_epoch = config.train.num_epochs - config.train.warmup_epoch
+    warmup_epoch = config.train.warmup_epoch if getattr(config.train, 'warmup_epoch', None) is not None else 15
+    max_epoch = max(1, config.train.num_epochs - warmup_epoch)
     
     # Fix GPU setting
     gpu = getattr(config, 'gpu', '0')
@@ -447,10 +490,11 @@ def self_train(config, pre_snapshot_path, snapshot_path, file_log):
     def worker_init_fn(worker_id):
         random.seed(config.seed + worker_id)
 
-    # Setup datasets
-    dataset = get_dataset_without_full_label(
+    # Setup datasets (use supervised_ratio for labeled split)
+    dataset = get_dataset(
         config,
         img_size=config.data.img_size,
+        supervised_ratio=config.data.get('supervised_ratio', 0.2),
         train_aug=config.data.train_aug,
         k=config.fold,
         lb_dataset=Dataset,
@@ -510,9 +554,12 @@ def self_train(config, pre_snapshot_path, snapshot_path, file_log):
     ema_model.train()
     iter_num = 0
     best_performance = 0.0
+    early_stop_patience = config.train.early_stop_patience if getattr(config.train, 'early_stop_patience', None) is not None else 10
+    early_stop_min_epochs = config.train.early_stop_min_epochs if getattr(config.train, 'early_stop_min_epochs', None) is not None else 30
+    no_improve_epochs = 0
     
     # Tính số epoch cho self-training
-    max_epoch = config.train.num_epochs - config.train.warmup_epoch
+    max_epoch = max(1, config.train.num_epochs - warmup_epoch)
 
     for epoch in range(max_epoch):
         source_dataset = zip(cycle(trainloader['l_loader']), trainloader['u_loader'])
@@ -572,12 +619,23 @@ def self_train(config, pre_snapshot_path, snapshot_path, file_log):
 
         if performance > best_performance:
             best_performance = performance
-            save_model(model, best_model_path)
+            save_model(model, best_model_path, metrics)
             save_optimizer(optimizer, best_optim_path)
-            message = f'Saved new best model with dice {performance:.4f}'
+            message = f'Saved new best model | Dice: {metrics["dice"]:.4f}, IoU: {metrics["iou"]:.4f}, HD: {metrics["hd"]:.4f}, Loss: {metrics["loss"]:.5f}'
             print(message)
             file_log.write(message + '\n')
             file_log.flush()
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+
+        if epoch >= early_stop_min_epochs and no_improve_epochs > early_stop_patience:
+            early_message = (f'Early stopping self-train at epoch {epoch} after '
+                             f'{no_improve_epochs} epochs without improvement.')
+            print(early_message)
+            file_log.write(early_message + '\n')
+            file_log.flush()
+            break
 
         model.train()
 

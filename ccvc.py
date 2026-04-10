@@ -25,10 +25,11 @@ def main(config):
     Args:
         config: Configuration object containing training parameters
     """
-    # Setup datasets and dataloaders
-    dataset = get_dataset_without_full_label(
-        config, 
+    # Setup datasets and dataloaders (use supervised_ratio for labeled split)
+    dataset = get_dataset(
+        config,
         img_size=config.data.img_size,
+        supervised_ratio=config.data.get('supervised_ratio', 0.2),
         train_aug=config.data.train_aug,
         k=config.fold,
         lb_dataset=Dataset,

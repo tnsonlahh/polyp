@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import os
+import warnings
 
 
 __all__ = ['ResNet', 'resnet50', 'resnet101']
@@ -153,9 +155,23 @@ class ResNet(nn.Module):
 def _resnet(arch, block, layers, pretrained, **kwargs):
     model = ResNet(block, layers, **kwargs)
     if pretrained:
-        pretrained_path = "pretrained/%s.pth" % arch
-        state_dict = torch.load(pretrained_path)
-        model.load_state_dict(state_dict, strict=False)
+        # Try common pretrained paths and fall back to random init if missing.
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        candidate_paths = [
+            os.path.join(project_root, 'pretrained', f'{arch}.pth'),
+            os.path.join('pretrained', f'{arch}.pth')
+        ]
+
+        pretrained_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+        if pretrained_path is not None:
+            state_dict = torch.load(pretrained_path, map_location='cpu')
+            model.load_state_dict(state_dict, strict=False)
+            print(f'Loaded pretrained backbone from: {pretrained_path}')
+        else:
+            warnings.warn(
+                f'Pretrained weights for {arch} not found. '
+                'Continuing with random initialization.'
+            )
     return model
 
 

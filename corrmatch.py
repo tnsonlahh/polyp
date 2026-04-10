@@ -72,6 +72,26 @@ def get_current_consistency_weight(epoch):
     return args.consistency * sigmoid_rampup(epoch, args.consistency_rampup)
 
 
+def save_checkpoint(model, optimizer, path, epoch, metrics):
+    """Save full training checkpoint with model, optimizer and metrics."""
+    checkpoint = {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'epoch': epoch,
+        'metrics': metrics
+    }
+    torch.save(checkpoint, str(path))
+
+
+def load_model_state(model, path):
+    """Load model from either full checkpoint or plain state_dict."""
+    checkpoint = torch.load(str(path), map_location='cpu')
+    if isinstance(checkpoint, dict) and 'model' in checkpoint:
+        model.load_state_dict(checkpoint['model'])
+    else:
+        model.load_state_dict(checkpoint)
+
+
 
 def main(config):
     """
@@ -81,13 +101,14 @@ def main(config):
         config: Configuration object containing training parameters
     """
     # Setup datasets and dataloaders
-    dataset = get_dataset_without_full_label(
+    dataset = get_dataset(
         config, 
         img_size=config.data.img_size,
+        supervised_ratio=config.data.get('supervised_ratio', 0.2),
         train_aug=config.data.train_aug,
         k=config.fold,
         lb_dataset=Dataset,
-        ulb_dataset=StrongWeakAugmentFromTransform # Sử dụng StrongWeakAugment4 giống CPS
+        ulb_dataset=StrongWeakAugment
     )
     
     l_train_loader = DataLoader(
@@ -147,13 +168,15 @@ def main(config):
     criterion_u = nn.CrossEntropyLoss(reduction='none')
     criterion_kl = nn.KLDivLoss(reduction='none')
     
-    train_val(config, model, train_loader, val_loader, criterion_l, criterion_u, criterion_kl)
+    train_val(config, model, train_loader, val_loader, criterion_l, criterion_u, criterion_kl,
+              best_model_dir, best_optim_dir, file_log)
     # test(config, model, best_model_dir, test_loader, criterion_l)
 
     
 
 
-def train_val(config, model, train_loader, val_loader, criterion_l, criterion_u, criterion_kl):
+def train_val(config, model, train_loader, val_loader, criterion_l, criterion_u, criterion_kl,
+              best_model_path, best_optim_path, file_log):
     """
     Training and validation function.
     """
@@ -166,8 +189,10 @@ def train_val(config, model, train_loader, val_loader, criterion_l, criterion_u,
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.train.num_epochs, eta_min=1e-6)
 
-    # Initialize MONAI metrics with correct number of classes
-    num_classes = config.model.num_classes  # Make sure this is defined in your config
+    # Initialize MONAI metrics with robust class fallback.
+    num_classes = 3
+    if hasattr(config, 'model') and getattr(config.model, 'num_classes', None) is not None:
+        num_classes = config.model.num_classes
     train_dice = DiceMetric(include_background=True, 
                            num_classes=num_classes,
                            reduction="mean")
@@ -178,22 +203,9 @@ def train_val(config, model, train_loader, val_loader, criterion_l, criterion_u,
     # Training loop
     max_dice_score = -float('inf')
     best_epoch = 0
-
-    
-    torch.save(model.state_dict(), best_model_dir)
-    
-    for epoch in range(config.train.num_epochs):
-        start = time.time()
-        
-        # Training phase
-        model.train()
-        train_metrics = {
-            'dice': 0,
-            'iou': 0,
-            'loss': 0
-        }
-        num_train = 0
-        
+    no_improve_epochs = 0
+    early_stop_patience = config.train.early_stop_patience if getattr(config.train, 'early_stop_patience', None) is not None else 20
+    early_stop_min_epochs = config.train.early_stop_min_epochs if getattr(config.train, 'early_stop_min_epochs', None) is not None else 30
 
     for epoch in range(config.train.num_epochs):
         start = time.time()
@@ -212,20 +224,21 @@ def train_val(config, model, train_loader, val_loader, criterion_l, criterion_u,
 
 
 
-        for i, (lb_batch, 
-                (img_u_w, img_u_s1, _, ignore_mask, cutmix_box1),
-                (img_u_w_mix, img_u_s1_mix, _, ignore_mask_mix, _)) in enumerate(train_loop):
+        for i, (lb_batch, u_batch, u_batch_mix) in enumerate(train_loop):
             
 
             img_x, mask_x = lb_batch['image'], lb_batch['label']
-            
+
             img_x, mask_x = img_x.cuda(), mask_x.cuda()
-            img_u_w = img_u_w.cuda()
-            img_u_s1, ignore_mask = img_u_s1.cuda(), ignore_mask.cuda()
-            cutmix_box1 = cutmix_box1.cuda()
-            img_u_w_mix = img_u_w_mix.cuda()
-            img_u_s1_mix = img_u_s1_mix.cuda()
-            ignore_mask_mix = ignore_mask_mix.cuda()
+            img_u_w = u_batch['img_w'].cuda()
+            img_u_s1 = u_batch['img_s'].cuda()
+            img_u_w_mix = u_batch_mix['img_w'].cuda()
+            img_u_s1_mix = u_batch_mix['img_s'].cuda()
+
+            # Build default masks for current unlabeled dataset format.
+            ignore_mask = torch.zeros(img_u_w.shape[0], img_u_w.shape[2], img_u_w.shape[3], device=img_u_w.device).long()
+            ignore_mask_mix = torch.zeros_like(ignore_mask)
+            cutmix_box1 = torch.zeros_like(ignore_mask).bool()
             b, c, h, w = img_x.shape
 
             with torch.no_grad():
@@ -410,18 +423,40 @@ def train_val(config, model, train_loader, val_loader, criterion_l, criterion_u,
         
         # Validation phase
         val_metrics = validate_model(model, val_loader)
+        val_message = (f'Validation | Loss: {val_metrics["loss"]:.5f}, '
+                       f'Dice: {val_metrics["dice"]:.4f}, '
+                       f'IoU: {val_metrics["iou"]:.4f}, '
+                       f'HD: {val_metrics["hd"]:.4f}')
+        print(val_message)
+        file_log.write(val_message + '\n')
+        file_log.flush()
         
         # Save best model based on Dice score
         if val_metrics['dice'] > max_dice_score:
             max_dice_score = val_metrics['dice']
             best_epoch = epoch
-            torch.save(model.state_dict(), best_model_dir)
+            save_checkpoint(model, optimizer, best_model_path, epoch, val_metrics)
+            torch.save(optimizer.state_dict(), best_optim_path)
             
             message = (f'New best epoch {epoch}! '
-                      f'Dice: {val_metrics["dice"]:.4f}')
+                      f'Loss: {val_metrics["loss"]:.5f}, '
+                      f'Dice: {val_metrics["dice"]:.4f}, '
+                      f'IoU: {val_metrics["iou"]:.4f}, '
+                      f'HD: {val_metrics["hd"]:.4f}')
             print(message)
             file_log.write(message + '\n')
             file_log.flush()
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+
+        if epoch >= early_stop_min_epochs and no_improve_epochs > early_stop_patience:
+            early_message = (f'Early stopping at epoch {epoch} after '
+                             f'{no_improve_epochs} epochs without improvement.')
+            print(early_message)
+            file_log.write(early_message + '\n')
+            file_log.flush()
+            break
         
         # Update learning rate
         scheduler.step()
@@ -461,18 +496,28 @@ def validate_model(model, val_loader):
             output_dict = model(img)
             # Get the main prediction output
             output = output_dict['out']
+
+            # Compute CE loss with class-index labels.
+            if label.ndim == 4 and label.shape[1] > 1:
+                label_idx = label.argmax(dim=1).long()
+                labels_onehot = label
+            elif label.ndim == 4 and label.shape[1] == 1:
+                label_idx = label.squeeze(1).long()
+                labels_onehot = torch.zeros_like(output)
+                labels_onehot.scatter_(1, label_idx.unsqueeze(1), 1)
+            else:
+                label_idx = label.long()
+                labels_onehot = torch.zeros_like(output)
+                labels_onehot.scatter_(1, label_idx.unsqueeze(1), 1)
+
+            batch_loss = F.cross_entropy(output, label_idx)
+            metrics['loss'] = (metrics['loss'] * num_val + batch_loss.item() * batch_len) / (num_val + batch_len)
+            num_val += batch_len
             
             # Convert predictions to one-hot format
             preds = torch.argmax(output, dim=1, keepdim=True)
             preds_onehot = torch.zeros_like(output)
             preds_onehot.scatter_(1, preds, 1)
-            
-            # Convert labels to one-hot format if needed
-            if len(label.shape) == 4:  # If already one-hot
-                labels_onehot = label
-            else:  # If not one-hot
-                labels_onehot = torch.zeros_like(output)
-                labels_onehot.scatter_(1, label.unsqueeze(1), 1)
                 
             # Compute metrics
             dice_metric(y_pred=preds_onehot, y=labels_onehot)
@@ -505,7 +550,7 @@ def test(config, model, model_dir, test_loader):
         model_dir: Path to saved model weights
         test_loader: Test data loader
     """
-    model.load_state_dict(torch.load(model_dir))
+    load_model_state(model, model_dir)
     metrics = validate_model(model, test_loader)
     
     # Save and print results
@@ -571,7 +616,7 @@ if __name__ == '__main__':
     config = DotDict(config)
     
     # Train each fold
-    for fold in [3,4,5]:
+    for fold in [1, 2, 3, 4, 5]:
         print(f"\n=== Training Fold {fold} ===")
         config['fold'] = fold
         
@@ -579,6 +624,7 @@ if __name__ == '__main__':
         exp_dir = f"{config.data.save_folder}/{args.exp}/fold{fold}"
         os.makedirs(exp_dir, exist_ok=True)
         best_model_dir = f'{exp_dir}/best.pth'
+        best_optim_dir = f'{exp_dir}/best_optim.pth'
         test_results_dir = f'{exp_dir}/test_results.txt'
         
         # Save config
