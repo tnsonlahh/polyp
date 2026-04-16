@@ -1,0 +1,35 @@
+nohup: ignoring input
+Starting sequential training with 10% labeled data and early stopping...
+Configuration used: Configs/kvasir_seg.yml
+=====================================
+1. Training FixMatch...
+Traceback (most recent call last):
+  File "/home/minhle/SSSS/fixmatch.py", line 24, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+=====================================
+2. Training BCP...
+Traceback (most recent call last):
+  File "/home/minhle/SSSS/BCP.py", line 6, in <module>
+    from skimage.measure import label
+ModuleNotFoundError: No module named 'skimage'
+=====================================
+3. Training CPS...
+Traceback (most recent call last):
+  File "/home/minhle/SSSS/cps.py", line 5, in <module>
+    import cv2
+ModuleNotFoundError: No module named 'cv2'
+=====================================
+4. Training CCVC...
+Traceback (most recent call last):
+  File "/home/minhle/SSSS/ccvc.py", line 9, in <module>
+    import torch.nn.functional as F
+ModuleNotFoundError: No module named 'torch'
+=====================================
+5. Training GTA...
+Traceback (most recent call last):
+  File "/home/minhle/SSSS/GTA_seg.py", line 5, in <module>
+    import cv2
+ModuleNotFoundError: No module named 'cv2'
+=====================================
+All training processes have been completed successfully!

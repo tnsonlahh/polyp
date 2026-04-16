@@ -28,9 +28,10 @@ def main(config):
         config: Configuration object containing training parameters
     """
     # Setup datasets and dataloaders
-    dataset = get_dataset_without_full_label(
+    dataset = get_dataset(
         config, 
         img_size=config.data.img_size,
+        supervised_ratio=config.data.get('supervised_ratio', 0.2),
         train_aug=config.data.train_aug,
         k=config.fold,
         lb_dataset=Dataset,
@@ -124,6 +125,9 @@ def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, 
     """
     Training and validation function.
     """
+    # Setup warmup_epochs with fallback if None
+    warmup_epochs = config.train.warmup_epochs if config.train.warmup_epochs is not None else 15
+    
     # Setup optimizers
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -179,7 +183,7 @@ def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, 
             label_l = batch_l['label'].cuda().float()
             img_u = batch_u['img_w'].cuda().float()
             
-            if epoch < config.train.warmup_epochs:
+            if epoch < warmup_epochs:
                 # Warmup phase - supervised training only
                 output = model(img_l)
                 sup_loss = criterion[0](output, label_l)
@@ -197,7 +201,7 @@ def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, 
                 unsup_loss = torch.tensor(0.0).cuda()
                 
             else:
-                if epoch == config.train.warmup_epochs:
+                if epoch == warmup_epochs:
                     # Initialize teacher and TA models with student weights
                     with torch.no_grad():
                         for t_params, s_params in zip(model_teacher.parameters(), model.parameters()):
@@ -242,7 +246,7 @@ def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, 
                 # Update student model with EMA
                 model.eval()
                 with torch.no_grad():
-                    ema_decay = min(1 - 1/(i_iter - len(train_loader['l_loader']) * config.train.warmup_epochs + 1), 0.999)
+                    ema_decay = min(1 - 1/(i_iter - len(train_loader['l_loader']) * warmup_epochs + 1), 0.999)
                     for t_params, s_params in zip(model.parameters(), model_ta.parameters()):
                         t_params.data = ema_decay * t_params.data + (1 - ema_decay) * s_params.data
                 model.train()
@@ -273,7 +277,7 @@ def train_val(config, model, model_teacher, model_ta, train_loader, val_loader, 
             file_log.flush()
 
         # Validation phase
-        if epoch < config.train.warmup_epochs:
+        if epoch < warmup_epochs:
             metrics = validate_model(model, val_loader, criterion)
         else:
             metrics = validate_model(model_teacher, val_loader, criterion)
