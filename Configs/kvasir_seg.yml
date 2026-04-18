@@ -23,6 +23,9 @@ train:
   u_batchsize: 4
   num_workers: 4
   num_epochs: 100
+  warmup_epochs: 15
+  confidence_threshold: 0.95
+  unsup_weight: 1.0
   early_stop_patience: 20
   early_stop_min_epochs: 30
   num_iters: False # số lần cập nhật mỗi epoch

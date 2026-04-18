@@ -28,7 +28,7 @@ def norm01(x):
 
 def process_multiclass_label(label_data):
     """Convert label image to one-hot encoded tensor"""
-    num_classes = 3  
+    num_classes = 2  
     h, w = label_data.shape
     one_hot = np.zeros((num_classes, h, w), dtype=np.float32)
     
@@ -49,37 +49,25 @@ class StrongWeakAugment(torch.utils.data.Dataset):
         self.num_samples = len(self.dataset)
 
         w_p = 0.3
-        s_p = 0.7
+        s_p = 0.6
         self.weak_augment = A.Compose([
             A.Resize(img_size, img_size),
-            A.ElasticTransform(
-                alpha=10, 
-                sigma=2,   
-                p=w_p
-            ),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
             A.RandomBrightnessContrast(
-                brightness_limit=0.2,
-                contrast_limit=0.2,
-                p=w_p
-            ),
-            A.GaussianBlur(
-                blur_limit=(3, 5),
+                brightness_limit=0.1,
+                contrast_limit=0.1,
                 p=w_p
             ),
         ])
         self.strong_augment = A.Compose([
             A.GaussNoise(
-                var_limit=(10.0, 50.0),
-                p=s_p
-            ),
-            A.ElasticTransform(
-                alpha=40, 
-                sigma=4,   
+                var_limit=(5.0, 30.0),
                 p=s_p
             ),
             A.RandomBrightnessContrast(
-                brightness_limit=0.3,
-                contrast_limit=0.3,
+                brightness_limit=0.2,
+                contrast_limit=0.2,
                 p=s_p
             ),
             A.GaussianBlur(
@@ -88,7 +76,7 @@ class StrongWeakAugment(torch.utils.data.Dataset):
             ),
             A.MotionBlur(
                 blur_limit=(3, 7),
-                p=s_p
+                p=0.3
             ),
         ])
         self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
